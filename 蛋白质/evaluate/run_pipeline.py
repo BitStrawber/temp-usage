@@ -1,193 +1,216 @@
 # -*- coding: utf-8 -*-
 
 import pandas as pd
+import numpy as np
 import os
 import argparse
 import re
 import tempfile
 from tqdm import tqdm
+import joblib
 
-# 导入您原始脚本中使用的核心库
+# 导入核心库
 import torch
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForMaskedLM,
-    DataCollatorForLanguageModeling,
-    TrainingArguments,
-    Trainer,
-    pipeline,
-)
+from sklearn.linear_model import RidgeCV
+from transformers import AutoTokenizer, AutoModelForMaskedLM
+
+
+# ------------------------------------------------------------------------------
+# 假设您有一个 utils.py 文件包含以下函数。
+# 如果没有，请将这些辅助函数放在此脚本的顶部或一个名为 utils.py 的文件中。
+# ------------------------------------------------------------------------------
+
+def check_device():
+    """检查可用的计算设备（优先使用GPU）。"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"✅ 使用设备: {device}")
+    return device
+
+
+def load_esm2_model(model_name, device):
+    """加载ESM-2模型和分词器。"""
+    print(f"正在从 '{model_name}' 加载 ESM-2 模型...")
+    # ESM模型在加载时可能会显示关于position_embeddings的警告，这是正常的，可以忽略
+    model = AutoModelForMaskedLM.from_pretrained(model_name).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    print("✅ ESM-2 模型加载成功。")
+    # --- 修改：只返回两个值 ---
+    return model, tokenizer
+
+
+def get_protein_embeddings_batch(sequences, model, tokenizer, device, repr_layer, batch_size):
+    """批量生成蛋白质序列的嵌入向量。"""
+    embeddings = []
+
+    # 按照批次处理序列以节省内存
+    for i in tqdm(range(0, len(sequences), batch_size), desc="生成嵌入向量"):
+        batch_seqs = sequences[i:i + batch_size]
+
+        # 使用tokenizer进行编码
+        inputs = tokenizer(batch_seqs, return_tensors="pt", padding=True, truncation=True, max_length=1024).to(device)
+
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=True)
+
+        # 安全检查：确保请求的层存在
+        num_layers = len(outputs.hidden_states)
+        if not (0 <= repr_layer < num_layers):
+            raise ValueError(
+                f"错误: 请求的层 '{repr_layer}' 超出模型范围。 "
+                f"此模型共有 {num_layers} 个层 (有效索引为 0 到 {num_layers - 1})。"
+            )
+
+        hidden_states = outputs.hidden_states[repr_layer]
+
+        # 对每个序列的嵌入向量取平均值（去除padding的影响）
+        for j, seq in enumerate(batch_seqs):
+            seq_len = inputs['attention_mask'][j].sum().item()
+            seq_embedding = hidden_states[j, 1:seq_len - 1].mean(dim=0).cpu().numpy()
+            embeddings.append(seq_embedding)
+
+    return np.array(embeddings)
 
 
 # ==============================================================================
-# 集成模型训练逻辑 (源自您的 train.py)
+# 集成模型训练逻辑 (嵌入向量 + 回归模型)
 # ==============================================================================
 
-def train_model(data_path: str, model_output_dir: str, base_model: str, epochs: int, batch_size: int):
+def train_model(data_path: str, model_output_path: str, base_model: str, repr_layer: int, batch_size: int):
     """
-    在蛋白质序列上训练/微调一个语言模型。
-    此函数会自动检测并使用CUDA（如果可用），否则回退到CPU。
-
-    Args:
-        data_path (str): 合并后的训练数据CSV文件路径。
-        model_output_dir (str): 用于保存微调后模型的目录。
-        base_model (str): Hugging Face上的基础模型名称 (例如, 'facebook/esm2_t33_650M_UR50D')。
-        epochs (int): 训练的轮数。
-        batch_size (int): 每个设备的训练批次大小。
+    使用ESM-2生成嵌入向量，并训练一个回归模型来预测分数。
     """
     print("=" * 80)
-    print(f"开始模型微调...")
+    print(f"开始训练打分模型 (嵌入+回归)...")
     print(f" -> 训练数据: {data_path}")
-    print(f" -> 基础模型: {base_model}")
-    print(f" -> 训练配置: {epochs} 个 epochs, 批大小为 {batch_size}")
-    print(f" -> 模型将保存至: {model_output_dir}")
+    print(f" -> ESM-2模型: {base_model} (使用第 {repr_layer} 层)")
+    print(f" -> 模型将保存至: {model_output_path}")
 
-    # --- 新增：设备检测逻辑 ---
-    use_cuda = torch.cuda.is_available()
-    device = "cuda" if use_cuda else "cpu"
-    print(f"检测到可用设备: {device.upper()}")
-    if not use_cuda:
-        print("[警告] 未检测到CUDA GPU，将使用CPU进行训练。这可能会非常缓慢。")
-    # --- 结束新增部分 ---
+    # 1. 初始化设备和ESM-2模型
+    device = check_device()
+    # --- 修改：接收两个返回值 ---
+    esm_model, tokenizer = load_esm2_model(base_model, device)
 
-    # 1. 加载分词器 (tokenizer) 和基础模型
-    tokenizer = AutoTokenizer.from_pretrained(base_model)
-    model = AutoModelForMaskedLM.from_pretrained(base_model)
+    # 2. 加载训练数据
+    df_train = pd.read_csv(data_path)
+    sequences = df_train['sequence'].tolist()
+    labels = df_train['label'].values
+    print(f"共 {len(sequences)} 条序列用于训练。")
 
-    # 2. 加载并处理数据集
-    raw_datasets = load_dataset('csv', data_files={'train': data_path})
-
-    def tokenize_function(examples):
-        return tokenizer(examples["sequence"], truncation=True, padding="max_length", max_length=512)
-
-    tokenized_datasets = raw_datasets.map(
-        tokenize_function,
-        batched=True,
-        num_proc=4,
-        remove_columns=["sequence", "label"]
+    # 3. 生成蛋白质嵌入向量
+    # --- 修改：移除 batch_converter 参数 ---
+    embeddings = get_protein_embeddings_batch(
+        sequences, esm_model, tokenizer, device, repr_layer, batch_size
     )
 
-    # 3. 设置数据整理器 (Data Collator)
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm_probability=0.15
-    )
+    # 4. 训练回归模型
+    print("嵌入向量生成完毕，开始训练回归模型...")
+    scoring_model = RidgeCV(alphas=np.logspace(-3, 3, 10), cv=5)
+    scoring_model.fit(embeddings, labels)
+    print(f"回归模型训练完成。交叉验证选出的最佳alpha值为: {scoring_model.alpha_:.4f}")
 
-    # 4. 设置训练参数
-    training_args = TrainingArguments(
-        output_dir=model_output_dir,
-        overwrite_output_dir=True,
-        num_train_epochs=epochs,
-        per_device_train_batch_size=batch_size,
-        save_steps=10_000,
-        save_total_limit=2,
-        prediction_loss_only=True,
-        logging_steps=500,
-        # --- 修改：根据检测结果明确告知Trainer是否使用CUDA ---
-        no_cuda=not use_cuda
-    )
-
-    # 5. 初始化并运行训练器 (Trainer)
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_datasets["train"],
-        data_collator=data_collator,
-    )
-
-    print("开始训练...")
-    trainer.train()
-    trainer.save_model(model_output_dir)
-    print("模型微调完成。")
+    # 5. 保存训练好的回归模型
+    joblib.dump(scoring_model, model_output_path)
+    print(f"✅ 模型已成功保存至: {model_output_path}")
     print("=" * 80)
 
-
 # ==============================================================================
-# 集成数据打分逻辑 (源自您的 predict.py)
+# 集成数据打分逻辑 (嵌入向量 + 回归模型)
 # ==============================================================================
 
-def score_data(model_path: str, base_model_path: str, data_to_score_path: str, output_file_path: str):
+def score_data(model_path: str, base_model: str, repr_layer: int, batch_size: int, data_to_score_path: str,
+               output_file_path: str):
     """
-    使用微调模型和基础模型对含有mask的序列进行打分（预测）。
-
-    Args:
-        model_path (str): 微调后模型的目录路径。
-        base_model_path (str): 基础模型的路径或名称。
-        data_to_score_path (str): 包含待打分序列的CSV文件路径。
-        output_file_path (str): 保存最终预测结果的文件路径。
+    使用训练好的回归模型，为新的蛋白质序列进行打分。
     """
     print("=" * 80)
-    print(f"开始数据打分...")
-    print(f" -> 微调模型: {model_path}")
-    print(f" -> 基础模型: {base_model_path}")
+    print(f"开始使用回归模型为多个序列列进行打分...")
+    print(f" -> 打分模型: {model_path}")
+    print(f" -> ESM-2模型: {base_model} (使用第 {repr_layer} 层)")
     print(f" -> 待打分数据: {data_to_score_path}")
 
-    # 自动检测是否有可用的GPU
-    device = 0 if torch.cuda.is_available() else -1
-    print(f"使用设备: {'cuda:0' if device == 0 else 'cpu'}")
-
-    # 1. 加载微调模型和基础模型的pipeline
-    pipe_finetuned = pipeline('fill-mask', model=model_path, device=device)
-    pipe_base = pipeline('fill-mask', model=base_model_path, device=device)
-
-    # 2. 加载待打分的数据
+    # 1. 初始化和加载
+    device = check_device()
     df = pd.read_csv(data_to_score_path)
+    scoring_model = joblib.load(model_path)
+    # --- 修改：接收两个返回值 (此行已正确，但为保持一致性而展示) ---
+    esm_model, tokenizer = load_esm2_model(base_model, device)
 
-    results = []
+    # 2. 定义需要被打分的序列列
+    sequence_columns_to_score = [
+        'mutated_sequence',
+        'predicted_sequence_finetuned',
+        'predicted_sequence_base'
+    ]
 
-    # 3. 遍历每一行数据进行预测
-    for index, row in tqdm(df.iterrows(), total=len(df), desc="正在打分序列"):
-        masked_sequence = row['masked_sequence']
+    for col in sequence_columns_to_score:
+        print(f"\n--- 正在处理列: '{col}' ---")
 
-        # 使用微调模型预测
-        outputs_finetuned = pipe_finetuned(masked_sequence)
-        temp_seq_finetuned = list(masked_sequence)
-        # 将mask位置替换为预测概率最高的氨基酸
-        for output in outputs_finetuned:
-            token = output['token_str']
-            temp_seq_finetuned[output['start']] = token
-        predicted_sequence_finetuned = "".join(temp_seq_finetuned)
+        if col not in df.columns:
+            print(f"⚠️ 警告: 指定的列 '{col}' 在CSV文件中不存在，已跳过。")
+            continue
 
-        # 使用基础模型预测
-        outputs_base = pipe_base(masked_sequence)
-        temp_seq_base = list(masked_sequence)
-        for output in outputs_base:
-            token = output['token_str']
-            temp_seq_base[output['start']] = token
-        predicted_sequence_base = "".join(temp_seq_base)
+        sequences_to_score = df[col].dropna().tolist()
+        if not sequences_to_score:
+            print(f"ℹ️ 列 '{col}' 中没有有效序列，跳过。")
+            continue
 
-        # 将预测结果添加到原始行数据中
-        result_row = row.to_dict()
-        result_row['predicted_sequence_finetuned'] = predicted_sequence_finetuned
-        result_row['predicted_sequence_base'] = predicted_sequence_base
-        results.append(result_row)
+        # --- 修改：移除 batch_converter 参数 ---
+        embeddings = get_protein_embeddings_batch(
+            sequences_to_score, esm_model, tokenizer, device, repr_layer, batch_size
+        )
 
-    # 4. 保存包含预测结果的新CSV文件
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(output_file_path, index=False)
+        print("嵌入向量生成完毕，开始预测分数...")
+        predictions = scoring_model.predict(embeddings)
 
-    print(f"数据打分完成，结果已保存至 {output_file_path}")
+        pred_series = pd.Series(predictions, index=df[col].dropna().index)
+
+        output_col_name = f"predicted_score_{col}"
+        df[output_col_name] = pred_series
+        df[output_col_name] = df[output_col_name].round(9)
+        print(f"✅ 已生成预测分数并添加到新列 '{output_col_name}'。")
+
+    # ... 后续分析和保存部分无需修改 ...
+    print("\n--- 正在进行优化分析和标注 ---")
+    score_finetuned = 'predicted_score_predicted_sequence_finetuned'
+    score_base = 'predicted_score_predicted_sequence_base'
+    original_score_col = 'DMS_score'
+    required_score_cols = [score_finetuned, score_base, original_score_col]
+
+    improvement_count = 0
+    if all(col in df.columns for col in required_score_cols):
+        condition = (df[score_finetuned] > df[score_base]) & \
+                    (df[score_base] > df[original_score_col])
+        df['是否优化成功'] = np.where(condition, '是', '否')
+        improvement_count = df['是否优化成功'].value_counts().get('是', 0)
+        print(f"分析完成。新列 '是否优化成功' 已添加。")
+        print(f"📈 优化成功 (微调分 > 基础分 > 原始DMS分) 的序列数量: {improvement_count}")
+    else:
+        missing_cols = [col for col in required_score_cols if col not in df.columns]
+        print(f"⚠️ 警告: 缺少进行分析所需的列: {missing_cols}。已跳过优化分析。")
+        df['是否优化成功'] = '分析跳过'
+
+    summary_data = {col: '' for col in df.columns}
+    summary_data[df.columns[0]] = "--- 统计结果 ---"
+    if '是否优化成功' in df.columns and improvement_count > 0:
+        summary_data['是否优化成功'] = f"总计优化成功: {improvement_count}"
+
+    summary_df = pd.DataFrame([summary_data])
+    results_df = pd.concat([df, summary_df], ignore_index=True)
+
+    results_df.to_csv(output_file_path, index=False, float_format='%.9f')
+    print(f"\n✅ 打分和分析完成！结果已保存到: {output_file_path}")
     print("=" * 80)
-
 
 # ==============================================================================
 # 自动化流程的核心逻辑
 # ==============================================================================
 
 def extract_dms_id_from_path(path: str) -> str:
-    """
-    从文件路径中提取DMS_id。
-    例如: '.../(activity)A0A247D711_LISMN_Stadelmann_2021/file.csv'
-    返回: 'A0A247D711_LISMN_Stadelmann_2021'
-    """
-    # 正则表达式匹配括号内容和紧随其后的蛋白质ID
+    """从文件路径中提取DMS_id。"""
     match = re.search(r'\((.*?)\)([^/]+)', path)
     if match:
-        # group(2) 是我们需要的蛋白质ID部分
         return match.group(2).strip()
     else:
-        # 如果正则不匹配，尝试使用目录名作为备选方案
         try:
             return os.path.basename(os.path.dirname(path))
         except Exception:
@@ -195,18 +218,7 @@ def extract_dms_id_from_path(path: str) -> str:
 
 
 def find_and_combine_data(target_dms_id: str, metadata_df: pd.DataFrame, dms_data_dir: str) -> pd.DataFrame:
-    """
-    根据元数据查找并合并用于训练的数据集。
-
-    Args:
-        target_dms_id (str): 目标蛋白质的DMS_id。
-        metadata_df (pd.DataFrame): 包含所有实验元数据的DataFrame。
-        dms_data_dir (str): 存储所有DMS数据集CSV文件的目录。
-
-    Returns:
-        pd.DataFrame: 一个包含所有匹配数据集的合并后的DataFrame。
-    """
-    # 1. 查找目标蛋白质的元数据
+    """根据元数据查找并合并数据集用于训练。"""
     target_protein_metadata = metadata_df[metadata_df['DMS_id'] == target_dms_id]
     if target_protein_metadata.empty:
         raise ValueError(f"DMS_id '{target_dms_id}' 在元数据文件中未找到。")
@@ -218,7 +230,6 @@ def find_and_combine_data(target_dms_id: str, metadata_df: pd.DataFrame, dms_dat
     print(f" -> selection_assay: {target_assay}")
     print(f" -> title: {target_title}")
 
-    # 2. 查找所有具有相同 selection_assay 和 title 的蛋白质
     matching_proteins = metadata_df[
         (metadata_df['selection_assay'] == target_assay) &
         (metadata_df['title'] == target_title)
@@ -226,7 +237,6 @@ def find_and_combine_data(target_dms_id: str, metadata_df: pd.DataFrame, dms_dat
 
     print(f"\n找到 {len(matching_proteins)} 个匹配的数据集用于数据扩展:")
 
-    # 3. 加载并合并这些数据集
     combined_df_list = []
     for _, row in matching_proteins.iterrows():
         dms_file = row['DMS_filename']
@@ -236,10 +246,8 @@ def find_and_combine_data(target_dms_id: str, metadata_df: pd.DataFrame, dms_dat
         if not os.path.exists(file_path):
             print(f"    [警告] 文件不存在，已跳过: {file_path}")
             continue
-
         try:
             df = pd.read_csv(file_path)
-            # 确保文件包含必需的列
             if 'mutated_sequence' in df.columns and 'DMS_score' in df.columns:
                 combined_df_list.append(df[['mutated_sequence', 'DMS_score']])
             else:
@@ -257,69 +265,63 @@ def find_and_combine_data(target_dms_id: str, metadata_df: pd.DataFrame, dms_dat
 
 def main():
     parser = argparse.ArgumentParser(description="使用扩展数据自动化蛋白质打分流程。")
-    parser.add_argument("--target_data_path", type=str, required=True,
-                        help="待打分的目标文件路径，例如 '.../(activity)PROTEIN_ID/file.csv'。")
+    parser.add_argument("--target_data_path", type=str, required=True, help="待打分的目标文件路径。")
     parser.add_argument("--metadata_file", type=str, required=True, help="元数据CSV文件路径 ('工作簿1.csv')。")
     parser.add_argument("--dms_data_dir", type=str, required=True, help="包含所有DMS原始数据的CSV文件的目录。")
     parser.add_argument("--output_base_dir", type=str, required=True, help="保存最终结果的基础目录。")
 
-    # 添加模型训练相关的参数
-    parser.add_argument("--base_model", type=str, default="facebook/esm2_t33_650M_UR50D", help="用于微调的基础模型。")
-    parser.add_argument("--epochs", type=int, default=3, help="训练轮数。")
-    parser.add_argument("--batch_size", type=int, default=4, help="训练批处理大小。")
-
+    parser.add_argument("--base_model", type=str, default="../../../esm2_model_local",
+                        help="用于生成嵌入向量的ESM-2模型路径。")
+    parser.add_argument("--repr_layer", type=int, default=12,
+                        help="从ESM-2模型的哪一层提取表征。对于33层模型，33是最后一层。")
+    parser.add_argument("--batch_size", type=int, default=16, help="生成嵌入向量时的批处理大小。")
     args = parser.parse_args()
 
-    # --- 步骤 1: 初始化并从路径中提取ID ---
     target_dms_id = extract_dms_id_from_path(args.target_data_path)
 
-    # 创建一个以 "(DMS_id_extended)" 命名的子文件夹来存放本次运行的结果
-    result_folder_name = f"({os.path.basename(os.path.dirname(args.target_data_path))}_extended)"
+    original_folder_name = os.path.basename(os.path.dirname(args.target_data_path))
+    result_folder_name = f"{original_folder_name}"
     final_output_dir = os.path.join(args.output_base_dir, result_folder_name)
     os.makedirs(final_output_dir, exist_ok=True)
 
     print(f"开始处理目标蛋白质: {target_dms_id}")
     print(f"结果将保存至: {final_output_dir}")
 
-    # --- 步骤 2: 数据扩展 ---
     try:
         metadata_df = pd.read_csv(args.metadata_file)
         combined_training_data = find_and_combine_data(target_dms_id, metadata_df, args.dms_data_dir)
-    except FileNotFoundError:
-        print(f"[错误] 元数据文件未找到: {args.metadata_file}")
-        return
     except Exception as e:
         print(f"[错误] 数据准备阶段失败: {e}")
         return
 
-    # --- 步骤 3 & 4: 训练和打分 ---
-    # 使用临时目录来管理中间文件，脚本执行完毕后会自动删除
+    # 使用临时目录管理中间文件
     with tempfile.TemporaryDirectory() as temp_dir:
-        temp_data_path = os.path.join(temp_dir, "training_data_for_model.csv")
+        temp_data_path = os.path.join(temp_dir, "training_data.csv")
 
-        # 准备训练数据：重命名列以匹配训练函数的要求
         training_df = combined_training_data[['mutated_sequence', 'DMS_score']].rename(
             columns={'mutated_sequence': 'sequence', 'DMS_score': 'label'}
         )
         training_df.to_csv(temp_data_path, index=False)
 
-        temp_model_dir = os.path.join(temp_dir, "fine_tuned_model")
+        temp_model_path = os.path.join(temp_dir, "scoring_model.joblib")
 
-        # 调用训练函数
+        # 训练回归模型
         train_model(
             data_path=temp_data_path,
-            model_output_dir=temp_model_dir,
+            model_output_path=temp_model_path,
             base_model=args.base_model,
-            epochs=args.epochs,
+            repr_layer=args.repr_layer,
             batch_size=args.batch_size
         )
 
-        # 调用打分函数
         final_output_file = os.path.join(final_output_dir, "prediction_results_scored.csv")
 
+        # 使用回归模型进行打分
         score_data(
-            model_path=temp_model_dir,
-            base_model_path=args.base_model,
+            model_path=temp_model_path,
+            base_model=args.base_model,
+            repr_layer=args.repr_layer,
+            batch_size=args.batch_size,
             data_to_score_path=args.target_data_path,
             output_file_path=final_output_file
         )
@@ -329,10 +331,15 @@ def main():
 
 
 if __name__ == "__main__":
-    # 命令行运行示例:
-    # python run_pipeline.py \
-    #   --target_data_path "autodl-tmp/总结果/(activity)A0A247D711_LISMN_Stadelmann_2021/prediction_results_from_low_scores.csv" \
-    #   --metadata_file "path/to/你的/工作簿1.csv" \
-    #   --dms_data_dir "path/to/your/dms_data_directory/" \
-    #   --output_base_dir "autodl-tmp/总结果/"
+
     main()
+
+    python run_pipeline.py \
+    --target_data_path "../../../总结果/(yeast growth)DLG4_HUMAN_Faure_2021/prediction_results_from_low_scores.csv" \
+    --metadata_file "../../../DMS_substitutions.csv" \
+    --dms_data_dir "../../../蛋白质数据/" \
+    --output_base_dir "../../../总结果/"
+
+autodl-tmp/总结果/(yeast growth)DLG4_HUMAN_Faure_2021
+
+
