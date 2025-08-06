@@ -79,7 +79,7 @@ def plot_single_correlation(ax, df, x_col, y_col, title, hue_col=None, point_col
     else:
         sns.scatterplot(x=x_col, y=y_col, data=df, ax=ax, color=point_color, alpha=0.8, s=15, edgecolor=None)
 
-    sns.regplot(x=x_col, y=y_col, data=subset, ax=ax, scatter=False, color='#e41a1c', ci=None)
+    sns.regplot(x=x_col, y=y_col, data=subset, ax=ax, scatter=False, color='#e41a1c', ci=None, line_kws={'alpha': 0.9})
 
     plot_text = f'Pearson r = {pearson_r:.3f}\nSpearman ρ = {spearman_r:.3f}'
     ax.text(0.05, 0.95, plot_text, transform=ax.transAxes, fontsize=10,
